@@ -16,6 +16,8 @@ import * as vscode from "vscode"
 import { modelDoesntSupportWebp } from "@/utils/model-utils"
 import { ToolUse } from "../assistant-message"
 import { ContextManager } from "../context/context-management/ContextManager"
+import { HookManager } from "../hooks/HookManager"
+import { HookResponseHandler } from "../hooks/handlers/HookResponseHandler"
 import { formatResponse } from "../prompts/responses"
 import { StateManager } from "../storage/StateManager"
 import { WorkspaceRootManager } from "../workspace"
@@ -51,6 +53,7 @@ import { ToolResultUtils } from "./tools/utils/ToolResultUtils"
 export class ToolExecutor {
 	private autoApprover: AutoApprove
 	private coordinator: ToolExecutorCoordinator
+	private hookResponseHandler: HookResponseHandler
 
 	// Auto-approval methods using the AutoApprove class
 	private shouldAutoApproveTool(toolName: ClineDefaultTool): boolean | [boolean, boolean] {
@@ -78,6 +81,7 @@ export class ToolExecutor {
 		private clineIgnoreController: ClineIgnoreController,
 		private contextManager: ContextManager,
 		private stateManager: StateManager,
+		private hookManager: HookManager,
 
 		// Configuration & Settings
 		private autoApprovalSettings: AutoApprovalSettings,
@@ -121,6 +125,18 @@ export class ToolExecutor {
 		private switchToActMode: () => Promise<boolean>,
 	) {
 		this.autoApprover = new AutoApprove(autoApprovalSettings, yoloModeToggled)
+
+		// Initialize the hook response handler
+		this.hookResponseHandler = new HookResponseHandler({
+			say: async (type, text) => {
+				await this.say(type, text)
+			},
+			addContext: (context: string) => {
+				// Add context to the task state if needed
+				// This could be extended to add context to the conversation
+				console.log("Hook provided additional context:", context)
+			},
+		})
 
 		// Initialize the coordinator and register all tool handlers
 		this.coordinator = new ToolExecutorCoordinator()
@@ -345,8 +361,31 @@ export class ToolExecutor {
 				return true
 			}
 
-			// Handle complete blocks
-			await this.handleCompleteBlock(block, config)
+			// Execute PreToolUse hooks if enabled
+			let modifiedBlock = block
+			const hookEnabled = await this.hookManager.isEnabled()
+			if (hookEnabled) {
+				const preHookResult = await this.hookManager.executePreToolUseHooks(block)
+				const { approved, modifiedBlock: hookModifiedBlock } = await this.hookResponseHandler.handlePreToolUseResponse(
+					preHookResult,
+					block,
+				)
+
+				if (!approved) {
+					// Tool execution was denied by hook
+					this.pushToolResult(formatResponse.toolDenied(), block)
+					await this.saveCheckpoint()
+					return true
+				}
+
+				// Use modified block if provided
+				if (hookModifiedBlock) {
+					modifiedBlock = hookModifiedBlock
+				}
+			}
+
+			// Handle complete blocks with potentially modified input
+			await this.handleCompleteBlock(modifiedBlock, config)
 			await this.saveCheckpoint()
 			return true
 		} catch (error) {
@@ -394,7 +433,19 @@ export class ToolExecutor {
 	 * Handle complete block execution
 	 */
 	private async handleCompleteBlock(block: ToolUse, config: any): Promise<void> {
-		const result = await this.coordinator.execute(config, block)
+		let result = await this.coordinator.execute(config, block)
+
+		// Execute PostToolUse hooks if enabled
+		const hookEnabled = await this.hookManager.isEnabled()
+		if (hookEnabled) {
+			const postHookResult = await this.hookManager.executePostToolUseHooks(block, result)
+			const { modifiedResponse } = await this.hookResponseHandler.handlePostToolUseResponse(postHookResult, result)
+
+			// Use modified response if provided
+			if (modifiedResponse !== undefined) {
+				result = modifiedResponse as ToolResponse
+			}
+		}
 
 		this.pushToolResult(result, block)
 
